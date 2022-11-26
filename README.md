@@ -29,7 +29,7 @@ class Order(OrderTable.Entity):
 
 class OrderItem(OrderTable.EntityItem):
     order_id = EntityKey(Order)
-    product_id = EntitySortKey(Product)
+    product_sku = EntitySortKey(Product)
     quantity = Attribute(int)
 
     order_items_by_order = AccessPatternMany(order_id)
@@ -40,12 +40,12 @@ OrderTable.create_table()
 product = Product(sku='test-product')
 product.save()
 
-order = Order(id=1, date_placed='2022-11-25T18:37')
+order = Order(id=1, date_placed='2022-11-25T18:37:11')
 order.save()
 
 order_item = OrderItem(
     order_id=order.id,
-    product_id=product.id,
+    product_sku=product.sku,
     quantity=1
 )
 order_item.save()
