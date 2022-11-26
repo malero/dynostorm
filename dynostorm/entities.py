@@ -161,12 +161,33 @@ class Entity(metaclass=EntityMeta):
         )
 
     @classmethod
-    def get_key_prefix(cls):
-        return f'{cls.__name__}#'
+    def from_response(cls, data):
+        kwargs = {}
+        for physical_name, value_dict in data.items():
+            value_type, value = list(value_dict.items())[0]
+            if physical_name == 'pk':
+                entity_type, value = cls.parse_key(value)
+                kwargs[cls.partition_field.logical_key] = cls.parse_physical_value(
+                    cls.partition_field.logical_key,
+                    value
+                )
+            elif physical_name == 'sk':
+                entity_type, value = cls.parse_key(value)
+                kwargs[cls.sort_field.logical_key] = cls.parse_physical_value(
+                    cls.sort_field.logical_key,
+                    value
+                )
+            else:
+                kwargs[physical_name] = cls.parse_physical_value(physical_name, value)
+        return cls(**kwargs)
 
     @classmethod
-    def get_sort_key_field(cls):
-        return cls.sort_keys.get('sk', None)
+    def parse_key(cls, key):
+        return key.split('#')
+
+    @classmethod
+    def get_key_prefix(cls):
+        return f'{cls.__name__}#'
 
     @classmethod
     def get(cls, gsi=None, **kwargs):
@@ -217,6 +238,11 @@ class Entity(metaclass=EntityMeta):
             return f'{cls.get_key_prefix()}{value}'
 
         return value
+
+    @classmethod
+    def parse_physical_value(cls, physical_key, value):
+        field = cls.fields.get(physical_key)
+        return field.parse(value)
 
 
 class TableMeta(type):

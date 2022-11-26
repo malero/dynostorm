@@ -3,44 +3,51 @@ class BaseField:
     logical_key = None
     physical_key = None
 
+    def __init__(self, parse_fn, *args, **kwargs):
+        self.parse_fn = parse_fn
+
+    def parse(self, value):
+        return self.parse_fn(value)
+
 
 class PartitionKey(BaseField):
-    def __init__(self, *fields, **kwargs):
-        pass
+    pass
 
 
 class SortKey(BaseField):
-    def __init__(self, *fields, **kwargs):
-        pass
+    pass
 
 
 class EntityKey(PartitionKey):
     def __init__(self, for_entity, *fields, **kwargs):
-        super().__init__(*fields, **kwargs)
         self.for_entity = for_entity
+        parse_fn = for_entity.partition_field.parse_fn
+        super().__init__(parse_fn, *fields, **kwargs)
 
 
 class EntitySortKey(SortKey):
     def __init__(self, for_entity, *fields, **kwargs):
-        super().__init__(*fields, **kwargs)
         self.for_entity = for_entity
+        parse_fn = for_entity.partition_field.parse_fn
+        super().__init__(parse_fn, *fields, **kwargs)
 
 
 class GlobalSecondaryIndex(BaseField):
     def __init__(self, partition, sort, **kwargs):
+        super().__init__(None, **kwargs)
         self.partition = partition
         self.sort = sort
 
 
 class Attribute(BaseField):
-    def __init__(self, *fields, **kwargs):
-        pass
+    pass
 
 
 class AccessPattern(BaseField):
     for_entity = None
 
     def __init__(self, *fields, return_collection=None):
+        super().__init__(None)
         self.gsi = None
         self.partition = None
         self.sort = None
@@ -130,10 +137,53 @@ class AccessPattern(BaseField):
     def __call__(self, *args, **kwargs):
         access_kwargs = self.get_access_kwargs(*args, **kwargs)
 
-        return self.for_entity.get(self.gsi, **access_kwargs)
+        response = self.for_entity.get(self.gsi, **access_kwargs)
+        items = response.get('Items', [])
+        """
+        {
+            'Items': [
+                {
+                    'quantity': {
+                        'N': '1'
+                    },
+                    'sk': {
+                        'S': 'Product#123'
+                    }, 
+                    pk': {
+                        'S': 'Order#101'
+                    }
+                }
+            ],
+            'Count': 1,
+            'ScannedCount': 1,
+            'ResponseMetadata': {
+                'RequestId': 'JECMEEB51FJERPJ08EUB1HRV27VV4KQNSO5AEMVJF66Q9ASUAAJG',
+                'HTTPStatusCode': 200,
+                'HTTPHeaders': {
+                    'server': 'Server',
+                    'date': 'Fri, 25 Nov 2022 23:59:55 GMT',
+                    'content-type': 'application/x-amz-json-1.0',
+                    'content-length': '109', 
+                    'connection': 'keep-alive',
+                    'x-amzn-requestid': 'JECMEEB51FJERPJ08EUB1HRV27VV4KQNSO5AEMVJF66Q9ASUAAJG',
+                    'x-amz-crc32': '3030131771'
+                },
+                'RetryAttempts': 0
+            }
+        }
+        """
+        if self.return_collection is True:
+            collection = []
+            for item in items:
+                collection.append(self.for_entity.from_response(item))
+            return collection
+        elif self.return_collection is False:
+            return self.for_entity.from_response(items[0])
+        else:
+            return items
 
 
-class AccessPatternOne(AccessPattern):
+class AccessPatternSingle(AccessPattern):
     def __init__(self, *args, **kwargs):
         kwargs['return_collection'] = False
         super().__init__(*args, **kwargs)
