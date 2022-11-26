@@ -1,41 +1,43 @@
 import boto3
 
-from attributes import PartitionKey, Attribute, GlobalSecondaryIndex, \
-    AccessPattern, SortKey, BaseAttribute
+from dynostorm import constants
+from dynostorm.attributes import PartitionKey, Attribute, GlobalSecondaryIndex, \
+    AccessPattern, SortKey, BaseField, EntityKey, EntitySortKey
 
 
 class EntityMeta(type):
     def __new__(mcs, clsname, bases, clsdict):
+        partition_field = None
+        sort_field = None
         fields = {}
         attributes = {}
-        partition_keys = {}
-        sort_keys = {}
         access_patterns = {}
         global_secondary_indexes = {}
 
         for name, val in clsdict.items():
-            if isinstance(val, BaseAttribute):
-                val.local_key = name
+            if isinstance(val, BaseField):
+                val.logical_key = name
                 fields[name] = val
 
             if isinstance(val, AccessPattern):
                 access_patterns[name] = val
             elif isinstance(val, Attribute):
                 attributes[name] = val
+                val.physical_key = name
             elif isinstance(val, PartitionKey):
-                partition_keys[name] = val
-                val.table_key = 'pk'
+                partition_field = val
+                val.physical_key = 'pk'
             elif isinstance(val, SortKey):
-                sort_keys[name] = val
-                val.table_key = 'sk'
+                sort_field = val
+                val.physical_key = 'sk'
             elif isinstance(val, GlobalSecondaryIndex):
                 global_secondary_indexes[name] = val
 
+        clsdict['partition_field'] = partition_field
+        clsdict['sort_field'] = sort_field
         clsdict['fields'] = fields
         clsdict['access_patterns'] = access_patterns
         clsdict['attributes'] = attributes
-        clsdict['partition_keys'] = partition_keys
-        clsdict['sort_keys'] = sort_keys
         clsdict['global_secondary_indexes'] = global_secondary_indexes
 
         clsobj = super().__new__(mcs, clsname, bases, clsdict)
@@ -53,48 +55,166 @@ class EntityMeta(type):
 
 class Entity(metaclass=EntityMeta):
     table = None
+    partition_field = None
+    sort_field = None
     fields = {}
     access_patterns = {}
     attributes = {}
-    partition_keys = {}
-    sort_keys = {}
     global_secondary_indexes = {}
 
-    def __init__(self, *fields, **kwargs):
-        pass
+    def __init__(self, **kwargs):
+        self._partition_attribute = None
+        self._sort_attribute = None
+
+        for logical_key, field in self.__class__.fields.items():
+            if isinstance(field, PartitionKey):
+                self._partition_attribute = field
+            elif isinstance(field, SortKey):
+                self._sort_attribute = field
+
+            if logical_key in kwargs:
+                setattr(self, logical_key, kwargs[logical_key])
+            else:
+                setattr(self, logical_key, None)
+
+    @property
+    def pk(self):
+        return self.get_field_value(self._partition_attribute.logical_key)
+
+    @property
+    def sk(self):
+        if self._sort_attribute is None:
+            return '$'
+        return self.get_field_value(self._sort_attribute.logical_key)
+
+    def get_field_value(self, logical_key):
+        return self.__class__.get_key_value(logical_key, getattr(self, logical_key))
+
+    def get_update_keys(self):
+        return {
+            'pk': {'S': self.pk},
+            'sk': {'S': self.sk},
+        }
+
+    def get_update_attributes(self):
+        name_attributes = {}
+        value_attributes = {}
+        value_map = {}
+        for logical_key, field in self.__class__.attributes.items():
+            value = getattr(self, logical_key)
+            if value is not None:
+                set_field_key = f'#{logical_key}'
+                set_value_key = f':{field.logical_key}'
+
+                value_map[set_field_key] = set_value_key
+                value_attributes[set_value_key] = value
+                name_attributes[set_field_key] = field.logical_key
+
+        for gsi_key, gsi in self.__class__.global_secondary_indexes.items():
+            i = self.__class__.table.get_gsi_index(gsi)
+            pk_set_key = f':pk{i}'
+            sk_set_key = f':sk{i}'
+            value_map[f'pk{i}'] = pk_set_key
+            value_map[f'sk{i}'] = sk_set_key
+            pk_logical_key = gsi.partition.logical_key
+            sk_logical_key = gsi.sort.logical_key
+            value_attributes[pk_set_key] = self.get_field_value(
+                pk_logical_key)
+            value_attributes[sk_set_key] = self.get_field_value(
+                sk_logical_key)
+
+        return {
+            'names': name_attributes,
+            'values': value_attributes,
+            'map': value_map,
+        }
+
+    def get_value_type_index(self, value):
+        if isinstance(value, int):
+            return 'N'
+        elif isinstance(value, float):
+            return 'N'
+        elif isinstance(value, str):
+            return 'S'
+        elif isinstance(value, bool):
+            return 'BOOL'
+
+    def save(self):
+        keys = self.get_update_keys()
+        update_attributes = self.get_update_attributes()
+        update_expression = f'set {", ".join([f"{field_key} = {set_key}" for field_key, set_key in update_attributes["map"].items()])}'
+        update_expression_values = {
+            set_key: {
+                self.get_value_type_index(value): str(value)
+            } for set_key, value in update_attributes['values'].items()
+        }
+        update_expression_names = {
+            field_key: field_name for field_key, field_name in update_attributes['names'].items()
+        }
+
+        self.__class__.table.client().update_item(
+            TableName=self.__class__.table.table_name,
+            Key=keys,
+            UpdateExpression=update_expression,
+            ExpressionAttributeValues=update_expression_values,
+            ExpressionAttributeNames=update_expression_names,
+        )
+
+    @classmethod
+    def get_key_prefix(cls):
+        return f'{cls.__name__}#'
+
+    @classmethod
+    def get_sort_key_field(cls):
+        return cls.sort_keys.get('sk', None)
 
     @classmethod
     def get(cls, gsi=None, **kwargs):
         key_conditions = {}
-        for table_key, value in kwargs.items():
-            key_conditions[table_key] = {
-                'ComparisonOperator': 'EQ',
-                'AttributeValueList': {
-                    'S': value
-                }
+        for attribute_key, value in kwargs.items():
+            comparison_operator = 'EQ'
+            if '__' in attribute_key:
+                attribute_key, op = attribute_key.split('__')
+                comparison_operator = constants.OP_MAP.get(op, 'EQ')
+
+            key_conditions[attribute_key] = {
+                'ComparisonOperator': comparison_operator,
+                'AttributeValueList': [
+                    {'S': value}
+                ]
             }
-        print(dict(
+
+        query_kwargs = dict(
             TableName=cls.table.table_name,
-            IndexName=gsi and gsi.local_key or None,
             KeyConditions=key_conditions
-        ))
+        )
+        if gsi is not None:
+            query_kwargs['IndexName'] = gsi.logical_key
+
+        return cls.table.client().query(**query_kwargs)
 
     @classmethod
-    def get_gsi_key(cls, local_key, gsi):
+    def get_gsi_key(cls, logical_key, gsi):
         gsi_index = cls.table.get_gsi_index(gsi)
-        if gsi.partition.local_key == local_key:
+        if gsi.partition.logical_key == logical_key:
             return f'pk{gsi_index}'
         else:
             return f'sk{gsi_index}'
 
     @classmethod
-    def get_key_value(cls, local_key, value):
-        field = cls.fields.get(local_key)
+    def get_key_value(cls, logical_key, value):
+        field = cls.fields.get(logical_key)
         if field is None:
-            raise ValueError(f'Field {local_key} not found on {cls}')
+            raise ValueError(f'Field {logical_key} not found on {cls}')
 
-        if isinstance(field, PartitionKey):
-            return f'{cls.__name__}#{value}'
+        if isinstance(field, EntityKey):
+            return f'{field.for_entity.get_key_prefix()}{value}'
+        elif isinstance(field, EntitySortKey):
+            return f'{field.for_entity.get_key_prefix()}{value}'
+        elif isinstance(field, PartitionKey):
+            return f'{cls.get_key_prefix()}{value}'
+        elif isinstance(field, SortKey):
+            return f'{cls.get_key_prefix()}{value}'
 
         return value
 
@@ -138,7 +258,7 @@ class Table(metaclass=TableMeta):
     @classmethod
     def get_gsi_index(cls, gsi):
         for i, gsi_key in cls.enumerate_gsis():
-            if gsi.local_key == gsi_key:
+            if gsi.logical_key == gsi_key:
                 return i
         return None
 
